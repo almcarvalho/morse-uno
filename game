@@ -19,14 +19,14 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 // Traco: 500 ms ou mais
 const unsigned long TEMPO_TRACO = 500;
 
-// Espera 2 segundos para finalizar letra
-const unsigned long PAUSA_LETRA = 2000;
+// Finaliza a letra apos 1,5 segundo sem novos sinais
+const unsigned long PAUSA_LETRA = 1500;
 
-// Espaco entre palavras no modo livre
-const unsigned long PAUSA_PALAVRA = 4500;
+// Insere espaco apos 3,5 segundos sem novos sinais
+const unsigned long PAUSA_PALAVRA = 3500;
 
-// Limpa digitacao livre apos 60 segundos
-const unsigned long TEMPO_LIMPEZA = 60000;
+// Modo livre nao possui limpeza automatica.
+// O LCD exibe uma janela deslizante dos ultimos 16 caracteres.
 
 // Debounce do botao
 const unsigned long DEBOUNCE = 25;
@@ -39,6 +39,17 @@ const unsigned long TEMPO_SAIR = 4000;
 
 // Tempo das mensagens de erro e acerto
 const unsigned long TEMPO_MENSAGEM = 2500;
+
+// MODO 5: audio Morse em velocidade moderada (~12 WPM)
+const unsigned long UNIDADE_AUDIO = 100;
+const int FREQUENCIA_AUDIO = 750;
+bool reproduzindo = false;
+bool audioLigado = false;
+byte indiceAudio = 0;
+byte indiceSinal = 0;
+unsigned long proximaEtapaAudio = 0;
+bool audioAguardandoPausa = false;
+bool audioIniciado = false;
 
 // =====================================
 // PALAVRAS DE 3 A 5 LETRAS
@@ -175,6 +186,9 @@ void mostrarMenu() {
     case 4:
       nome = "NUMBERS";
       break;
+    case 5:
+      nome = "LISTEN";
+      break;
   }
 
   linhaLCD(0, "MODO " + String(modo) + " " + nome);
@@ -188,7 +202,12 @@ void mostrarJogo() {
 
   // MODO 1
   if (modo == 1) {
-    linhaLCD(0, historico);
+    // Janela deslizante: nunca reinicia ao completar 16 colunas.
+    if (historico.length() > 16) {
+      linhaLCD(0, historico.substring(historico.length() - 16));
+    } else {
+      linhaLCD(0, historico);
+    }
 
     if (codigo.length() > 0) {
       linhaLCD(1, "MORSE: " + codigo);
@@ -205,6 +224,17 @@ void mostrarJogo() {
       linhaLCD(1, "MORSE: " + codigo);
     } else {
       linhaLCD(1, "Digite Morse");
+    }
+  }
+
+  // MODO 5: nao revelar a palavra durante a escuta
+  else if (modo == 5) {
+    if (reproduzindo) {
+      linhaLCD(0, "OUCA O MORSE...");
+      linhaLCD(1, "Aguarde audio");
+    } else {
+      linhaLCD(0, "DIGITE OUVINDO");
+      linhaLCD(1, digitado + (codigo.length() ? " " + codigo : ""));
     }
   }
 
@@ -299,7 +329,87 @@ void novaPalavra() {
   mostrarJogo();
 
   Serial.print("PALAVRA: ");
-  Serial.println(palavra);
+  Serial.println(modo == 5 ? "(oculta no LCD)" : palavra);
+  if (modo == 5) iniciarAudio();
+}
+
+// =====================================
+// MODO 5 - REPRODUCAO MORSE NAO BLOQUEANTE
+// =====================================
+
+void iniciarAudio() {
+  reproduzindo = true;
+  audioLigado = false;
+  audioAguardandoPausa = false;
+  audioIniciado = false;
+  indiceAudio = 0;
+  indiceSinal = 0;
+  proximaEtapaAudio = millis() + 700;
+  mostrarJogo();
+}
+
+// Executa a sequencia sem travar o loop do Arduino.
+// Ponto=1 unidade, traco=3, pausa entre sinais=1, letras=3.
+void atualizarAudio(unsigned long agora) {
+  if (!reproduzindo || (long)(agora - proximaEtapaAudio) < 0) return;
+
+  if (audioLigado) {
+    noTone(BUZZER);
+    audioLigado = false;
+    audioAguardandoPausa = true;
+    proximaEtapaAudio = agora + UNIDADE_AUDIO;
+    return;
+  }
+
+  if (audioAguardandoPausa) {
+    audioAguardandoPausa = false;
+    indiceSinal++;
+    const char* sinais = tabelaMorse[0];
+    char letra = palavra[indiceAudio];
+    for (byte i = 0; i < 36; i++) {
+      if (tabelaLetras[i] == letra) {
+        sinais = tabelaMorse[i];
+        break;
+      }
+    }
+    if (sinais[indiceSinal] == '\0') {
+      indiceAudio++;
+      indiceSinal = 0;
+      // Ja passou 1 unidade; faltam 2 para completar 3 entre letras
+      proximaEtapaAudio = agora + 2 * UNIDADE_AUDIO;
+    } else {
+      proximaEtapaAudio = agora;
+    }
+    return;
+  }
+
+  if (indiceAudio >= palavra.length()) {
+    reproduzindo = false;
+    noTone(BUZZER);
+    mostrarJogo();
+    Serial.println("LISTEN: audio concluido. Digite a palavra.");
+    return;
+  }
+
+  char letra = palavra[indiceAudio];
+  const char* sinais = "";
+  for (byte i = 0; i < 36; i++) {
+    if (tabelaLetras[i] == letra) {
+      sinais = tabelaMorse[i];
+      break;
+    }
+  }
+  char sinal = sinais[indiceSinal];
+  if (sinal == '\0') {
+    indiceAudio++;
+    indiceSinal = 0;
+    proximaEtapaAudio = agora + 3 * UNIDADE_AUDIO;
+    return;
+  }
+
+  tone(BUZZER, FREQUENCIA_AUDIO);
+  audioLigado = true;
+  proximaEtapaAudio = agora + (sinal == '-' ? 3 : 1) * UNIDADE_AUDIO;
 }
 
 // =====================================
@@ -332,6 +442,8 @@ void novoNumero() {
 // =====================================
 
 void voltarMenu() {
+  reproduzindo = false;
+  noTone(BUZZER);
   menuAtivo = true;
   modo = 1;
 
@@ -360,7 +472,7 @@ void mostrarPlacar() {
   noTone(BUZZER);
   bipAtivo = false;
 
-  linhaLCD(0, "DESAFIO ENCERR.");
+  linhaLCD(0, modo == 5 ? "LISTEN: PLACAR" : "DESAFIO ENCERR.");
   linhaLCD(
     1,
     "A:" + String(acertos) +
@@ -410,11 +522,9 @@ void selecionarModo() {
 // =====================================
 
 void modoDigitacao(char letra) {
-  if (historico.length() >= 16) {
-    historico = "";
-  }
-
   historico += letra;
+  Serial.print("TEXTO: ");
+  Serial.println(historico);
 
   ultimaAtividade = millis();
   espacoInserido = false;
@@ -515,6 +625,35 @@ void modoDesafio(char letra) {
 }
 
 // =====================================
+// MODO 5 - LISTEN
+// Cada palavra completa vale 1 acerto; qualquer letra errada
+// encerra a rodada e conta 1 erro, como no desafio.
+void modoListen(char letra) {
+  if (letra == palavra[posicao]) {
+    digitado += letra;
+    posicao++;
+    if (posicao >= palavra.length()) {
+      acertos++;
+      estado = MOSTRANDO_RESULTADO;
+      inicioMensagem = millis();
+      beep(1800, 250);
+      linhaLCD(0, "ACERTOU: " + palavra);
+      linhaLCD(1, "A:" + String(acertos) + " E:" + String(erros));
+    } else {
+      beep(1500, 100);
+      mostrarJogo();
+    }
+  } else {
+    erros++;
+    estado = MOSTRANDO_RESULTADO;
+    inicioMensagem = millis();
+    beep(300, 350);
+    linhaLCD(0, "ERA: " + palavra);
+    linhaLCD(1, "A:" + String(acertos) + " E:" + String(erros));
+  }
+}
+
+// =====================================
 // MODO 4 - NUMBERS
 // =====================================
 
@@ -575,6 +714,9 @@ void processarLetra(char letra) {
     case 4:
       modoNumbers(letra);
       break;
+    case 5:
+      modoListen(letra);
+      break;
   }
 }
 
@@ -586,7 +728,7 @@ void aoPressionar(unsigned long agora) {
   inicioPressao = agora;
   saidaExecutada = false;
 
-  if (!menuAtivo && estado == JOGANDO) {
+  if (!menuAtivo && estado == JOGANDO && !reproduzindo) {
     bipAtivo = false;
     tone(BUZZER, 900);
   }
@@ -596,14 +738,14 @@ void aoSoltar(unsigned long agora) {
   unsigned long duracao =
     agora - inicioPressao;
 
-  noTone(BUZZER);
+  if (!reproduzindo) noTone(BUZZER);
   bipAtivo = false;
 
   // MENU
   if (menuAtivo) {
     modo++;
 
-    if (modo > 4) {
+    if (modo > 5) {
       modo = 1;
     }
 
@@ -626,7 +768,7 @@ void aoSoltar(unsigned long agora) {
     return;
   }
 
-  if (estado != JOGANDO) {
+  if (estado != JOGANDO || reproduzindo) {
     return;
   }
 
@@ -693,7 +835,7 @@ void lerBotao(unsigned long agora) {
     noTone(BUZZER);
     bipAtivo = false;
 
-    if (modo == 3) {
+    if (modo == 3 || modo == 5) {
       mostrarPlacar();
     }
     else {
@@ -709,7 +851,7 @@ void lerBotao(unsigned long agora) {
 void processarPausas(unsigned long agora) {
   if (menuAtivo) return;
   if (estado != JOGANDO) return;
-  if (botaoPressionado) return;
+  if (botaoPressionado || reproduzindo) return;
 
   if (
     letraPendente &&
@@ -737,11 +879,10 @@ void processarPausas(unsigned long agora) {
     !espacoInserido &&
     agora - fimPressao >= PAUSA_PALAVRA
   ) {
-    if (
-      historico.length() < 16 &&
-      historico[historico.length() - 1] != ' '
-    ) {
+    if (historico[historico.length() - 1] != ' ') {
       historico += " ";
+      Serial.print("TEXTO: ");
+      Serial.println(historico);
     }
 
     espacoInserido = true;
@@ -802,7 +943,7 @@ void setup() {
   randomSeed(analogRead(A0));
 
   linhaLCD(0, "MORSE TRAINER");
-  linhaLCD(1, "4 MODOS");
+  linhaLCD(1, "5 MODOS");
 
   delay(1500);
 
@@ -820,6 +961,7 @@ void loop() {
 
   lerBotao(agora);
   atualizarBeep(agora);
+  atualizarAudio(agora);
 
   // MENU AUTOMATICO APOS 3 SEGUNDOS
   if (
@@ -832,19 +974,6 @@ void loop() {
 
   processarPausas(agora);
   processarMensagens(agora);
-
-  // LIMPEZA AUTOMATICA NO MODO 1
-  if (
-    !menuAtivo &&
-    modo == 1 &&
-    historico.length() > 0 &&
-    agora - ultimaAtividade >= TEMPO_LIMPEZA
-  ) {
-    historico = "";
-    espacoInserido = true;
-
-    mostrarJogo();
-  }
 
   delay(5);
 }
