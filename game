@@ -1,0 +1,664 @@
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+#define BOTAO 2
+#define BUZZER 8
+
+// ========== TEMPOS ==========
+const unsigned long TEMPO_TRACO = 400;
+const unsigned long PAUSA_LETRA = 850;
+const unsigned long PAUSA_PALAVRA = 1800;
+const unsigned long LIMPEZA = 60000;
+const unsigned long DEBOUNCE = 25;
+
+const unsigned long ESPERA_MENU = 3000;
+const unsigned long TOQUE_RAPIDO = 170;
+const unsigned long INTERVALO_RAPIDO = 220;
+const byte TOTAL_TOQUES_SAIR = 5;
+
+const unsigned long TEMPO_MENSAGEM = 1600;
+
+// ========== PALAVRAS ==========
+const char* palavras[] = {
+  "SOL", "MAR", "PAZ", "LUZ", "RIO",
+  "CASA", "GATO", "PATO", "BOLA", "VIDA",
+  "AMOR", "LUA", "SOM", "FLOR", "FOGO",
+  "RADIO", "MORSE", "LIVRO", "CARRO",
+  "NUVEM", "TEMPO", "PRAIA", "PEDRA",
+  "VENTO", "NOITE", "PORTA", "MUNDO",
+  "PONTE", "TERRA", "CAMPO"
+};
+
+const int TOTAL_PALAVRAS =
+  sizeof(palavras) / sizeof(palavras[0]);
+
+// ========== MORSE ==========
+const char* tabelaMorse[] = {
+  ".-", "-...", "-.-.", "-..", ".", "..-.",
+  "--.", "....", "..", ".---", "-.-", ".-..",
+  "--", "-.", "---", ".--.", "--.-", ".-.",
+  "...", "-", "..-", "...-", ".--", "-..-",
+  "-.--", "--..",
+  "-----", ".----", "..---", "...--", "....-",
+  ".....", "-....", "--...", "---..", "----."
+};
+
+const char tabelaLetras[] =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+// ========== MODOS ==========
+byte modo = 1;
+bool menuAtivo = true;
+unsigned long ultimaInteracaoMenu = 0;
+
+// ========== ESTADOS ==========
+enum Estado {
+  JOGANDO,
+  MOSTRANDO_DICA,
+  MOSTRANDO_RESULTADO,
+  PLACAR_FINAL
+};
+
+Estado estado = JOGANDO;
+unsigned long inicioMensagem = 0;
+
+// ========== BOTAO ==========
+bool botaoPressionado = false;
+bool leituraAnterior = false;
+
+unsigned long ultimaMudanca = 0;
+unsigned long inicioPressao = 0;
+unsigned long fimPressao = 0;
+
+// ========== MORSE ==========
+String codigo = "";
+String historico = "";
+
+bool letraPendente = false;
+bool espacoInserido = false;
+unsigned long ultimaAtividade = 0;
+
+// ========== JOGO ==========
+String palavra = "";
+String digitado = "";
+
+byte posicao = 0;
+int ultimaPalavra = -1;
+
+unsigned int acertos = 0;
+unsigned int erros = 0;
+
+// ========== NUMBERS ==========
+char numeroAtual = '0';
+char ultimoNumero = 'X';
+
+// ========== 5 TOQUES ==========
+byte toquesRapidos = 0;
+unsigned long ultimoToqueRapido = 0;
+
+// ========== BUZZER ==========
+bool bipAtivo = false;
+unsigned long fimBip = 0;
+
+// ------------------------------------
+// LCD
+// ------------------------------------
+
+void linhaLCD(byte linha, String texto) {
+  lcd.setCursor(0, linha);
+  lcd.print("                ");
+  lcd.setCursor(0, linha);
+  lcd.print(texto.substring(0, 16));
+}
+
+void mostrarMenu() {
+  String nome;
+
+  if (modo == 1) nome = "DIGITAR";
+  if (modo == 2) nome = "TREINO";
+  if (modo == 3) nome = "DESAFIO";
+  if (modo == 4) nome = "NUMBERS";
+
+  linhaLCD(0, "MODO " + String(modo) + " " + nome);
+  linhaLCD(1, "AUTO EM 3 SEG");
+}
+
+void mostrarJogo() {
+  if (menuAtivo || estado != JOGANDO) return;
+
+  if (modo == 1) {
+    linhaLCD(0, historico);
+
+    if (codigo.length() > 0)
+      linhaLCD(1, "MORSE: " + codigo);
+    else
+      linhaLCD(1, "Aguardando...");
+  }
+  else if (modo == 4) {
+    linhaLCD(0, "NUMERO: " + String(numeroAtual));
+
+    if (codigo.length() > 0)
+      linhaLCD(1, "MORSE: " + codigo);
+    else
+      linhaLCD(1, "Digite Morse");
+  }
+  else {
+    linhaLCD(0, palavra);
+
+    String linha = digitado;
+
+    if (codigo.length() > 0) {
+      linha += " ";
+      linha += codigo;
+    }
+
+    linhaLCD(1, linha);
+  }
+}
+
+// ------------------------------------
+// SOM
+// ------------------------------------
+
+void beep(int frequencia, unsigned long duracao) {
+  tone(BUZZER, frequencia);
+  bipAtivo = true;
+  fimBip = millis() + duracao;
+}
+
+void atualizarBeep(unsigned long agora) {
+  if (bipAtivo &&
+      (long)(agora - fimBip) >= 0) {
+    bipAtivo = false;
+
+    if (!botaoPressionado)
+      noTone(BUZZER);
+  }
+}
+
+// ------------------------------------
+// MORSE
+// ------------------------------------
+
+char traduzir(String codigoMorse) {
+  for (int i = 0; i < 36; i++) {
+    if (codigoMorse == tabelaMorse[i])
+      return tabelaLetras[i];
+  }
+
+  return '?';
+}
+
+String dicaMorse(char letra) {
+  for (int i = 0; i < 36; i++) {
+    if (letra == tabelaLetras[i])
+      return String(tabelaMorse[i]);
+  }
+
+  return "?";
+}
+
+// ------------------------------------
+// PALAVRAS
+// ------------------------------------
+
+void novaPalavra() {
+  int indice;
+
+  do {
+    indice = random(TOTAL_PALAVRAS);
+  } while (TOTAL_PALAVRAS > 1 &&
+           indice == ultimaPalavra);
+
+  ultimaPalavra = indice;
+  palavra = palavras[indice];
+
+  digitado = "";
+  posicao = 0;
+  codigo = "";
+  letraPendente = false;
+  toquesRapidos = 0;
+  estado = JOGANDO;
+
+  mostrarJogo();
+}
+
+// ------------------------------------
+// NUMBERS
+// ------------------------------------
+
+void novoNumero() {
+  char novo;
+
+  do {
+    novo = '0' + random(10);
+  } while (novo == ultimoNumero);
+
+  ultimoNumero = novo;
+  numeroAtual = novo;
+
+  codigo = "";
+  letraPendente = false;
+  toquesRapidos = 0;
+  estado = JOGANDO;
+
+  mostrarJogo();
+}
+
+// ------------------------------------
+// MENU
+// ------------------------------------
+
+void voltarMenu() {
+  menuAtivo = true;
+  modo = 1;
+  estado = JOGANDO;
+
+  codigo = "";
+  historico = "";
+  letraPendente = false;
+  toquesRapidos = 0;
+  espacoInserido = false;
+
+  ultimaInteracaoMenu = millis();
+
+  beep(1200, 130);
+  mostrarMenu();
+}
+
+void mostrarPlacar() {
+  estado = PLACAR_FINAL;
+
+  codigo = "";
+  letraPendente = false;
+  toquesRapidos = 0;
+
+  noTone(BUZZER);
+  bipAtivo = false;
+
+  linhaLCD(0, "DESAFIO ENCERR.");
+  linhaLCD(1,
+    "A:" + String(acertos) +
+    " E:" + String(erros));
+}
+
+void selecionarModo() {
+  menuAtivo = false;
+  estado = JOGANDO;
+
+  codigo = "";
+  historico = "";
+  letraPendente = false;
+  toquesRapidos = 0;
+  espacoInserido = false;
+  ultimaAtividade = millis();
+
+  acertos = 0;
+  erros = 0;
+
+  beep(1700, 140);
+
+  if (modo == 1) {
+    mostrarJogo();
+  }
+  else if (modo == 4) {
+    novoNumero();
+  }
+  else {
+    novaPalavra();
+  }
+}
+
+// ------------------------------------
+// PROCESSAR LETRA
+// ------------------------------------
+
+void processarLetra(char letra) {
+  Serial.print("RECEBIDO: ");
+  Serial.println(letra);
+
+  // MODO 1
+  if (modo == 1) {
+    if (historico.length() >= 16)
+      historico = "";
+
+    historico += letra;
+    ultimaAtividade = millis();
+    espacoInserido = false;
+    mostrarJogo();
+  }
+
+  // MODO 2
+  else if (modo == 2) {
+    char correta = palavra[posicao];
+
+    if (letra == correta) {
+      digitado += letra;
+      posicao++;
+
+      beep(1500, 100);
+
+      if (posicao >= palavra.length()) {
+        estado = MOSTRANDO_RESULTADO;
+        inicioMensagem = millis();
+
+        linhaLCD(0, "PARABENS!");
+        linhaLCD(1, palavra);
+      }
+      else {
+        mostrarJogo();
+      }
+    }
+    else {
+      estado = MOSTRANDO_DICA;
+      inicioMensagem = millis();
+
+      beep(300, 250);
+
+      linhaLCD(0, "ERRO! LETRA: " + String(correta));
+      linhaLCD(1, "DICA: " + dicaMorse(correta));
+    }
+  }
+
+  // MODO 3
+  else if (modo == 3) {
+    char correta = palavra[posicao];
+
+    if (letra == correta) {
+      digitado += letra;
+      posicao++;
+
+      if (posicao >= palavra.length()) {
+        acertos++;
+        estado = MOSTRANDO_RESULTADO;
+        inicioMensagem = millis();
+
+        beep(1800, 250);
+
+        linhaLCD(0, "PALAVRA CERTA!");
+        linhaLCD(1,
+          "A:" + String(acertos) +
+          " E:" + String(erros));
+      }
+      else {
+        mostrarJogo();
+      }
+    }
+    else {
+      erros++;
+      estado = MOSTRANDO_RESULTADO;
+      inicioMensagem = millis();
+
+      beep(300, 350);
+
+      linhaLCD(0, "ERRO: " + palavra);
+      linhaLCD(1,
+        "A:" + String(acertos) +
+        " E:" + String(erros));
+    }
+  }
+
+  // MODO 4 - NUMBERS
+  else if (modo == 4) {
+    if (letra == numeroAtual) {
+      estado = MOSTRANDO_RESULTADO;
+      inicioMensagem = millis();
+
+      beep(1800, 200);
+
+      linhaLCD(0, "NUMERO CORRETO!");
+      linhaLCD(1, String(numeroAtual) + " = " +
+                        dicaMorse(numeroAtual));
+    }
+    else {
+      estado = MOSTRANDO_DICA;
+      inicioMensagem = millis();
+
+      beep(300, 250);
+
+      linhaLCD(0, "ERRO! NUM: " + String(numeroAtual));
+      linhaLCD(1, "DICA: " + dicaMorse(numeroAtual));
+    }
+  }
+}
+
+// ------------------------------------
+// BUFFER DOS 5 TOQUES
+// ------------------------------------
+
+void descarregarToques() {
+  if (toquesRapidos == 0) return;
+
+  for (byte i = 0; i < toquesRapidos; i++)
+    codigo += ".";
+
+  letraPendente = true;
+  fimPressao = ultimoToqueRapido;
+  toquesRapidos = 0;
+
+  mostrarJogo();
+}
+
+void registrarPulso(unsigned long duracao,
+                    unsigned long agora) {
+  if (duracao < 40) return;
+
+  if (duracao <= TOQUE_RAPIDO) {
+    if (toquesRapidos > 0 &&
+        agora - ultimoToqueRapido >
+        INTERVALO_RAPIDO + TOQUE_RAPIDO) {
+      descarregarToques();
+    }
+
+    toquesRapidos++;
+    ultimoToqueRapido = agora;
+
+    if (toquesRapidos >= TOTAL_TOQUES_SAIR) {
+      toquesRapidos = 0;
+
+      if (modo == 3)
+        mostrarPlacar();
+      else
+        voltarMenu();
+
+      return;
+    }
+
+    return;
+  }
+
+  descarregarToques();
+
+  codigo +=
+    (duracao < TEMPO_TRACO) ? "." : "-";
+
+  letraPendente = true;
+  fimPressao = agora;
+
+  mostrarJogo();
+}
+
+// ------------------------------------
+// BOTAO
+// ------------------------------------
+
+void aoPressionar(unsigned long agora) {
+  inicioPressao = agora;
+
+  if (!menuAtivo && estado == JOGANDO) {
+    bipAtivo = false;
+    tone(BUZZER, 900);
+  }
+}
+
+void aoSoltar(unsigned long agora) {
+  unsigned long duracao = agora - inicioPressao;
+
+  noTone(BUZZER);
+  bipAtivo = false;
+
+  if (menuAtivo) {
+    modo++;
+    if (modo > 4) modo = 1;
+
+    ultimaInteracaoMenu = agora;
+
+    beep(1100, 90);
+    mostrarMenu();
+    return;
+  }
+
+  if (estado == PLACAR_FINAL) {
+    voltarMenu();
+    return;
+  }
+
+  if (estado != JOGANDO) return;
+
+  registrarPulso(duracao, agora);
+}
+
+void lerBotao(unsigned long agora) {
+  bool leitura = digitalRead(BOTAO) == LOW;
+
+  if (leitura != leituraAnterior)
+    ultimaMudanca = agora;
+
+  if (agora - ultimaMudanca >= DEBOUNCE &&
+      leitura != botaoPressionado) {
+
+    botaoPressionado = leitura;
+
+    if (botaoPressionado)
+      aoPressionar(agora);
+    else
+      aoSoltar(agora);
+  }
+
+  leituraAnterior = leitura;
+}
+
+// ------------------------------------
+// PAUSAS MORSE
+// ------------------------------------
+
+void processarPausas(unsigned long agora) {
+  if (menuAtivo || estado != JOGANDO) return;
+  if (botaoPressionado) return;
+
+  if (toquesRapidos > 0 &&
+      agora - ultimoToqueRapido >
+      INTERVALO_RAPIDO + TOQUE_RAPIDO) {
+    descarregarToques();
+  }
+
+  if (letraPendente &&
+      codigo.length() > 0 &&
+      agora - fimPressao >= PAUSA_LETRA) {
+
+    char letra = traduzir(codigo);
+
+    codigo = "";
+    letraPendente = false;
+
+    processarLetra(letra);
+  }
+
+  if (modo == 1 &&
+      historico.length() > 0 &&
+      !espacoInserido &&
+      agora - fimPressao >= PAUSA_PALAVRA) {
+
+    if (historico.length() < 16 &&
+        historico[historico.length() - 1] != ' ')
+      historico += " ";
+
+    espacoInserido = true;
+    mostrarJogo();
+  }
+}
+
+// ------------------------------------
+// MENSAGENS
+// ------------------------------------
+
+void processarMensagens(unsigned long agora) {
+  if (estado != MOSTRANDO_DICA &&
+      estado != MOSTRANDO_RESULTADO)
+    return;
+
+  if (agora - inicioMensagem < TEMPO_MENSAGEM)
+    return;
+
+  if (estado == MOSTRANDO_DICA) {
+    estado = JOGANDO;
+    codigo = "";
+    letraPendente = false;
+    mostrarJogo();
+  }
+  else {
+    if (modo == 4)
+      novoNumero();
+    else
+      novaPalavra();
+  }
+}
+
+// ------------------------------------
+// SETUP
+// ------------------------------------
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(BOTAO, INPUT_PULLUP);
+  pinMode(BUZZER, OUTPUT);
+
+  lcd.init();
+  lcd.backlight();
+
+  randomSeed(analogRead(A0));
+
+  linhaLCD(0, "MORSE TRAINER");
+  linhaLCD(1, "4 MODOS");
+
+  delay(1200);
+
+  ultimaInteracaoMenu = millis();
+  mostrarMenu();
+}
+
+// ------------------------------------
+// LOOP
+// ------------------------------------
+
+void loop() {
+  unsigned long agora = millis();
+
+  lerBotao(agora);
+  atualizarBeep(agora);
+
+  if (menuAtivo &&
+      !botaoPressionado &&
+      agora - ultimaInteracaoMenu >= ESPERA_MENU) {
+    selecionarModo();
+  }
+
+  processarPausas(agora);
+  processarMensagens(agora);
+
+  if (!menuAtivo &&
+      modo == 1 &&
+      historico.length() > 0 &&
+      agora - ultimaAtividade >= LIMPEZA) {
+
+    historico = "";
+    espacoInserido = true;
+    mostrarJogo();
+  }
+
+  delay(5);
+}
